@@ -17,7 +17,7 @@ cd external/EQNet/
 
 pip install -r requirements.txt
 
-pip install obspy, fastapi
+pip install obspy fastapi
 
 ```
 
