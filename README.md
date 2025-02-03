@@ -4,8 +4,6 @@ A Python package to process distributed acousting sensing real-time data streams
 
 ## Installation
 
-### Preparation
-
 In order to install DAS-realtime, you need to have first create a conda environment and install all the required packages. Run the following commands after cloning the repo.
 
 ```
