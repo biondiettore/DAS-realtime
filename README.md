@@ -6,9 +6,20 @@ A Python package to process distributed acousting sensing real-time data streams
 
 ### Preparation
 
-In order to install DAS-realtime, you need to have first create a conda environment and install all the required packages.
+In order to install DAS-realtime, you need to have first create a conda environment and install all the required packages. Run the following commands after cloning the repo.
 
 ```
-conda create -n DAS-RT python=3.10
+conda env create -f environment.yml
+
+git submodule update --init --recursive external/EQNet
+
+cd external/EQNet/
+
+pip install -r requirements.txt
+
+pip install obspy, fastapi
+
 ```
+
+In addition, you will need to have PyEarthworm installed as well as Earthworm. Follow the installation guide within the [PyEarthworm](https://github.com/Boritech-Solutions/PyEarthworm) repository.
 

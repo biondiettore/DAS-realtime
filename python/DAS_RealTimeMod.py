@@ -3,27 +3,18 @@ import numpy as np
 from obspy.core.trace import Trace 
 from obspy.core.trace import Stats
 from obspy.core.utcdatetime import UTCDateTime
-import os, sys
+import os
 
-# SeedLink necessary 
+# Necessary for multi-threading 
 import asyncio
-from  simplemseed import MiniseedHeader, MiniseedRecord, MSeed3Header, MSeed3Record, encodeSteim2, encodeSteim2FrameBlock, seedcodec
 
 # Necessary to run PhaseNet-DAS in real time
 import threading
 import dateutil.parser
+from datetime import datetime, timezone
 import atexit
 import pandas as pd
-# Adding pyDAS location
-DAS_util_path = "/home/ebiondi/packages/DAS-utilities/"
-pyDAS_path = DAS_util_path+"build/" # Substitute this path with yours
-try:
-    os.environ['LD_LIBRARY_PATH'] += ":" + pyDAS_path
-except:
-    os.environ['LD_LIBRARY_PATH'] = pyDAS_path
-sys.path.insert(0,pyDAS_path)
-sys.path.insert(0,DAS_util_path+'python/') # Substitute this path with yours
-import DASutils
+# DAS utilities related to picking process
 import DAS_ML
 
 
@@ -35,7 +26,7 @@ time_format = "%Y-%m-%dT%H%M%SZ"
 
 class RingBuffer:
     """ class that implements a not-yet-full buffer """
-    def __init__(self, buff_size):
+    def __init__(self, buff_size, good_ch):
         """
         Input:
         buff_size [int]: maximum number of time samples in the ring buffer  
@@ -44,6 +35,7 @@ class RingBuffer:
             raise ValueError("buff_size must be a positive integer")
         self.max = buff_size
         self.data = []
+        self.good_ch = good_ch
         self.channels_info = None
         self.timeStamps = [] # Rolling buffer of timestamp axis
 
@@ -51,7 +43,7 @@ class RingBuffer:
             """ class that implements a full buffer """
             def append(self, x, timestamps=None):
                 """ Append an element overwriting the oldest one. """
-                self.data[self.cur] = np.expand_dims(x, axis=1)
+                self.data[self.cur] = np.expand_dims(x[self.good_ch], axis=1)
                 if timestamps is not None:
                     self.timeStamps[self.cur] = timestamps
                 self.cur = (self.cur+1) % self.max
@@ -84,7 +76,18 @@ class RingBuffer:
                 return
             
             def send2ew(self, fs, waveMod, ringID=0, scaling=1e6):
-                """Function to send buffered data to Earthworm wavering"""
+                """
+                    Sends buffered seismic data to Earthworm wavering.
+
+                    Parameters:
+                        - fs (float): Sampling frequency of the data.
+                        - waveMod (object): Earthworm wave module instance to send data to.
+                        - ringID (int, optional): Identifier for the Earthworm ring. Defaults to 0.
+                        - scaling (float, optional): Scaling factor for the data. Defaults to 1e6.
+
+                    Returns:
+                        - None
+                """
                 if scaling > 1.0:
                     traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
                     dataFormat = 'i4'
@@ -100,7 +103,7 @@ class RingBuffer:
                         'station': self.stats[idx].station, 
                         'network': self.stats[idx].network, 
                         'channel': self.stats[idx].channel, 
-                        'location': '', 
+                        'location': '--', 
                         'nsamp': npts, 
                         'samprate': fs, 
                         'startt': timestamp_init,
@@ -111,76 +114,9 @@ class RingBuffer:
                     waveMod.put_wave(ringID, wave)
                 return
             
-            async def sendMSEED3dali(self, fs, dali, scaling=1e6, encoding="", blocks=63, mseed="MSEED2"):
-                """Function to send packet through Ringserver"""
-                # Getting channel data to write and timestamps
-                traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
-                timeStamps = self.getTimeStamps()
-                if mseed == "MSEED3":
-                    for idx in range(len(self.chIds)):
-                        network = self.stats[idx].network
-                        station = self.stats[idx].station
-                        location = ""
-                        channel = self.stats[idx].channel
-                        # numsamples = traceData[idx,:].shape[0]
-                        sampleRate = fs
-                        starttime = timeStamps[0]
-                        header = MSeed3Header()
-                        header.starttime = starttime
-                        header.sampleRatePeriod = sampleRate
-                        header.network = network
-                        header.station = " "+station
-                        header.location = location
-                        header.channel = channel
-                        identifier = "FDSN:%s%s_DAS_%s_H_HHS_1"%(network,station,channel)
-                        if encoding == "STEIM2":
-                            header.encoding = seedcodec.STEIM2
-                            data = traceData[idx,:]
-                            while len(data) > 0:
-                                frameBlock = encodeSteim2FrameBlock(data, blocks)
-                                encoded = frameBlock.pack()
-                                ms3record = MSeed3Record(header, identifier, encoded)
-                                sendResult = await dali.writeMSeed3(ms3record)
-                                data = data[frameBlock.numSamples:]
-                        else:
-                            Data = traceData[idx,:]
-                            ms3record = MSeed3Record(header, identifier, Data)
-                            sendResult = await dali.writeMSeed3(ms3record)
-                elif mseed == "MSEED2":
-                        for idx in range(len(self.chIds)):
-                            network = self.stats[idx].network
-                            station = self.stats[idx].station
-                            location = ""
-                            channel = self.stats[idx].channel
-                            # numsamples = traceData[idx,:].shape[0]
-                            sampleRate = fs
-                            starttime = timeStamps[0]
-                            if encoding == "STEIM2":
-                                msh = MiniseedHeader(network, station, location, channel, starttime, data.shape[0], sampleRate)
-                                msh.encoding = seedcodec.STEIM2
-                                data = traceData[idx,:]
-                                encoded = encodeSteim2(data)
-                                msr = MiniseedRecord(msh, data=None, encodedData=encoded)
-                                sendResult = await dali.writeMSeed(msr)
-                                # while len(data) > 0:
-                                #     frameBlock = encodeSteim2FrameBlock(data, blocks)
-                                #     encoded = frameBlock.pack()
-                                #     msh = MiniseedHeader(network, station, location, channel, starttime, data.shape[0], sampleRate)
-                                #     msr = MiniseedRecord(msh, encoded)
-                                #     sendResult = await dali.writeMSeed(msr)
-                                #     data = data[frameBlock.numSamples:]
-                            else:
-                                Data = traceData[idx,:]
-                                msh = MiniseedHeader(network, station, location, channel, starttime, Data.shape[0], sampleRate)
-                                msr = MiniseedRecord(msh, Data)
-                                sendResult = await dali.writeMSeed(msr)
-                else:
-                    raise ValueError("Provided unknown mseed format: %s"%mseed)
-                return
-
     def append(self, x, timestamps=None):
         """append an element at the end of the buffer"""
-        self.data.append(np.expand_dims(x, axis=1))
+        self.data.append(np.expand_dims(x[self.good_ch], axis=1))
         if timestamps is not None:
             self.timeStamps.append(timestamps)
         if len(self.data) == self.max:
@@ -210,12 +146,15 @@ class RingBuffer:
         self.chIds = [int(stat.split(" ")[-1][:-1].split("/")[1]) for stat in station_dict['stations']]
         # Creating stats for traces
         self.stats = []
+        self.statNames = [] # Necessary for streaming traveltime picks
         for idx in range(len(self.chIds)):
             stat = Stats()
             stat.network = network_codes[idx]
             stat.station = station_codes[idx]
             stat.channel = channel_codes[idx]
             self.stats.append(stat)
+            self.statNames.append("%s.%s.%s.--"%(station_codes[idx],channel_codes[idx],network_codes[idx]))
+        self.statNames = np.array(self.statNames)
         return
     
     def writeObsPyTraces(self, fs, datapath, scaling=1e6):
@@ -248,13 +187,15 @@ class RingBuffer:
             dataFormat = 'f4'
         npts = traceData.shape[1]
         timeStamps = self.getTimeStamps()
-        timestamp_init = timeStamps[0].timestamp()
+        # Ensure the timestamp is in UTC
+        timestamp_init = timeStamps[0].astimezone(timezone.utc).timestamp()
+        print(timeStamps, timestamp_init)
         for idx in range(len(self.chIds)):
             wave = {
                 'station': self.stats[idx].station, 
                 'network': self.stats[idx].network, 
                 'channel': self.stats[idx].channel, 
-                'location': '', 
+                'location': '--', 
                 'nsamp': npts, 
                 'samprate': fs, 
                 'startt': timestamp_init,
@@ -311,7 +252,7 @@ def start_picking_thread(device="cuda"):
 
     return loop
 
-async def real_time_picking_async(DASdata, dt, timeStamps):
+async def real_time_picking_async(DASdata, dt, timeStamps, minbuf=2.0, maxbuf=68.0):
     """Function performing real-time"""
     time_format_picking = "%Y-%m-%dT%H:%M:%S.%f+00:00" 
     fs = 1.0/dt
@@ -323,10 +264,76 @@ async def real_time_picking_async(DASdata, dt, timeStamps):
         TT_picks["station_id"] = TT_picks["station_id"].apply(lambda x: int(x))
         TT_picks['phase_time'] = pd.to_datetime(TT_picks['phase_time'])
         TT_picks["phase_time_seconds"] = TT_picks["phase_time"].apply(lambda x: (x - first_timestamp).total_seconds())
-        # TT_picks = TT_picks[(TT_picks['phase_time_seconds'] >= 15) & (TT_picks['phase_time_seconds'] <= 70)]
+        TT_picks = TT_picks[(TT_picks['phase_time_seconds'] >= minbuf) & (TT_picks['phase_time_seconds'] <= maxbuf)]
+        if len(TT_picks) == 0:
+            return None
         TT_picks["begin_time"] = first_timestamp
-        TT_picks["peak Strain rate [nm/m/s]"] = DASutils.extract_peak_amp(DASdata, TT_picks["phase_time_seconds"].to_numpy(), 
+        TT_picks["peak Strain rate [nm/m/s]"] = DAS_ML.extract_peak_amp(DASdata, TT_picks["phase_time_seconds"].to_numpy(), 
                                   fs , 0.0, 0.0, 25.0, chIDs=TT_picks["station_id"].to_numpy())
     return TT_picks
 
+Pickcounter = 0
+def merge_stream_picks(TT_picksBuf, TT_picksNew, delta_t_thres=2.0, maxBuf=3600.0, pickRing=None, streamCh=None, chCodes=None, qualityThresHold=[1.0,0.97,0.9,0.0], quality_values=[0,1,2,3]):
+    """Function to buffer traveltime picks and stream them using a pyEarthworm pickring"""
+    global Pickcounter  # Declare Pickcounter as global inside the function
+    # Remove any pick with picking time greater than maxBuf
+    curTimeUTC = datetime.now(timezone.utc)
+    if TT_picksBuf is None and TT_picksNew is None:
+        return None
     
+    # Check if any picks is more than maxBuf old
+    if TT_picksBuf is not None:
+        TT_picksBuf["phase_time_seconds"] = TT_picksBuf["phase_time"].apply(lambda x: (curTimeUTC - x).total_seconds())
+        TT_picksBuf = TT_picksBuf[TT_picksBuf['phase_time_seconds'] < maxBuf]
+        if len(TT_picksBuf) == 0:
+            return None
+
+    # Checking if same time pick is present within picking buffer
+    if TT_picksBuf is not None and TT_picksNew is not None:
+        TT_picks = pd.concat([TT_picksBuf, TT_picksNew])
+    elif TT_picksBuf is None and TT_picksNew is not None:
+        TT_picks = TT_picksNew
+    else:
+        return TT_picksBuf
+
+    # Sort by 'station_id', 'phase_type' and 'phase_time'
+    TT_picks = TT_picks.sort_values(by=['station_id', 'phase_type', 'phase_time'])
+
+    # Calculate the time differences within each group of 'station_id' and 'phase_type'
+    TT_picks['time_diff'] = TT_picks.groupby(['station_id', 'phase_type'])['phase_time'].diff().dt.total_seconds().abs()
+
+    # Keep only the rows where the time difference is greater than 2 seconds or is NaN (first element in the group)
+    TT_picks = TT_picks[(TT_picks['time_diff'] > delta_t_thres) | (TT_picks['time_diff'].isna())]
+
+    # Streaming new picks if available and pickRing was provided
+    TT_picksNew = TT_picks[TT_picks['time_diff'].isna()]
+
+    if len(TT_picksNew) > 0:
+        # Assigning given quality to picks 
+        # Convert the 'phase_score' column to numeric, forcing errors to NaN
+        TT_picksNew['phase_score'] = pd.to_numeric(TT_picksNew['phase_score'], errors='coerce')
+        conditions = [
+            (TT_picksNew['phase_score'] >= qualityThresHold[0]),
+            (TT_picksNew['phase_score'] >= qualityThresHold[1]) & (TT_picksNew['phase_score'] < qualityThresHold[0]),
+            (TT_picksNew['phase_score'] >= qualityThresHold[2]) & (TT_picksNew['phase_score'] < qualityThresHold[1]),
+            (TT_picksNew['phase_score'] < qualityThresHold[2])
+        ]
+        TT_picksNew['Q'] = np.select(conditions, quality_values)
+
+        # Pick ring provided and streamed channel list provided?
+        if pickRing is not None and streamCh is not None:
+            # Checking if streamed channels have any new pick
+            TT_picksNew = TT_picksNew[TT_picksNew["station_id"].isin(streamCh)]
+            if len(TT_picksNew) > 0:
+                # Adding new picks to pickRing
+                for _, pick in TT_picksNew.iterrows():
+                    chidx = np.where(streamCh == pick["station_id"])[0]
+                    picktime = pick["phase_time"].strftime("%Y-%m-%dT%H%M%S.%f+00:00")[:-6].replace("-", "").replace("T","").replace(":", "")
+                    pickString = "8 99 4 %s %s ?%s %s 0 0 0"%(Pickcounter, chCodes[chidx], pick['Q'], picktime)
+                    pickRing.put_msg(1, 8, pickString)
+                    Pickcounter += 1
+        else:
+            print("Cannot stream picks through pick ring without a running pickRing and a provided streamCh")
+    # Drop the 'time_diff' column as it's no longer needed
+    TT_picks = TT_picks.drop(columns=['time_diff'])
+    return TT_picks
