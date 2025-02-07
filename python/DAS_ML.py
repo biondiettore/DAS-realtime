@@ -147,3 +147,22 @@ def phasenet_das(das_data, timestamp, ev_id, dt):
     with torch.cuda.device(args.device):
         torch.cuda.empty_cache()
     return picks
+
+
+def extract_peak_amp(data,TT,fs,ot,f1,f2, chIDs=None, align_wind=1.0):
+    """Function to compute SNR for a given earthquake"""
+    maxAmp = np.zeros_like(TT)
+    nch = data.shape[0] if chIDs is None else chIDs.shape[0]
+    nt = data.shape[1]
+    dt = 1.0/fs
+    align_wind= align_wind + 1.0/(f1+f2)
+    if chIDs is None:
+        chIDs = range(nch)
+    for ich in range(nch):
+        ch = chIDs[ich]
+        min_t_align = TT[ich]-align_wind*0.5
+        max_t_align = TT[ich]+align_wind*0.5
+        it_min_wind = max(0,int((min_t_align-ot)/dt+0.5))
+        it_max_wind = min(nt-1,int((max_t_align-ot)/dt+0.5))
+        maxAmp[ich] = abs(data[ch,it_min_wind:it_max_wind]).max()
+    return maxAmp
