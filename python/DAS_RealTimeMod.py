@@ -273,67 +273,95 @@ async def real_time_picking_async(DASdata, dt, timeStamps, minbuf=2.0, maxbuf=68
     return TT_picks
 
 Pickcounter = 0
-def merge_stream_picks(TT_picksBuf, TT_picksNew, delta_t_thres=2.0, maxBuf=3600.0, pickRing=None, streamCh=None, chCodes=None, qualityThresHold=[1.0,0.97,0.9,0.0], quality_values=[0,1,2,3]):
-    """Function to buffer traveltime picks and stream them using a pyEarthworm pickring"""
+def merge_stream_picks(TT_picksBuf, TT_picksNew, delta_t_thres=2.0, maxBuf=3600.0, pickRing=None, streamCh=None, chCodes=None, minPhaseScore=0.6, qualityThresHold=[1.0, 0.97, 0.9, 0.0], quality_values=[0, 1, 2, 3]):
+    """Function to buffer traveltime picks and stream them using a pyEarthworm pick ring"""
     global Pickcounter  # Declare Pickcounter as global inside the function
-    # Remove any pick with picking time greater than maxBuf
+
+    # Get current time in UTC
     curTimeUTC = datetime.now(timezone.utc)
+
     if TT_picksBuf is None and TT_picksNew is None:
         return None
-    
-    # Check if any picks is more than maxBuf old
+
+    # Ensure 'phase_time' is a datetime object in both buffers
     if TT_picksBuf is not None:
+        TT_picksBuf = TT_picksBuf.copy()
+        TT_picksBuf["phase_time"] = pd.to_datetime(TT_picksBuf["phase_time"])
+
+        # Remove old picks beyond maxBuf
         TT_picksBuf["phase_time_seconds"] = TT_picksBuf["phase_time"].apply(lambda x: (curTimeUTC - x).total_seconds())
-        TT_picksBuf = TT_picksBuf[TT_picksBuf['phase_time_seconds'] < maxBuf]
+        TT_picksBuf = TT_picksBuf[TT_picksBuf["phase_time_seconds"] < maxBuf]
+        
         if len(TT_picksBuf) == 0:
             return None
 
-    # Checking if same time pick is present within picking buffer
+    if TT_picksNew is not None:
+        TT_picksNew = TT_picksNew.copy()
+        TT_picksNew["phase_time"] = pd.to_datetime(TT_picksNew["phase_time"])
+
+    # Combine the buffers
     if TT_picksBuf is not None and TT_picksNew is not None:
         TT_picks = pd.concat([TT_picksBuf, TT_picksNew])
     elif TT_picksBuf is None and TT_picksNew is not None:
         TT_picks = TT_picksNew
     else:
-        return TT_picksBuf
+        return TT_picksBuf  # Nothing new, return the buffer
 
-    # Sort by 'station_id', 'phase_type' and 'phase_time'
+    # Sort by station_id, phase_type, and phase_time
     TT_picks = TT_picks.sort_values(by=['station_id', 'phase_type', 'phase_time'])
 
-    # Calculate the time differences within each group of 'station_id' and 'phase_type'
+    # Compute time difference between consecutive picks within the same station and phase
     TT_picks['time_diff'] = TT_picks.groupby(['station_id', 'phase_type'])['phase_time'].diff().dt.total_seconds().abs()
 
-    # Keep only the rows where the time difference is greater than 2 seconds or is NaN (first element in the group)
+    # Keep only new picks that are sufficiently spaced apart
     TT_picks = TT_picks[(TT_picks['time_diff'] > delta_t_thres) | (TT_picks['time_diff'].isna())]
 
-    # Streaming new picks if available and pickRing was provided
-    TT_picksNew = TT_picks[TT_picks['time_diff'].isna()]
+    # Select new picks for streaming
+    TT_picksNew = TT_picks[(TT_picks['time_diff'] > delta_t_thres) | (TT_picks['time_diff'].isna())]
 
+    if TT_picksBuf is not None:
+        # Find picks in TT_picksNew that are NOT in TT_picksBuf
+        TT_picksNew = TT_picksNew.merge(TT_picksBuf[['station_id', 'phase_type', 'phase_time']], 
+                                        on=['station_id', 'phase_type', 'phase_time'], 
+                                        how='left', 
+                                        indicator=True)
+        # Keep only the new picks
+        TT_picksNew = TT_picksNew[TT_picksNew['_merge'] == 'left_only'].drop(columns=['_merge'])
+    
     if len(TT_picksNew) > 0:
-        # Assigning given quality to picks 
-        # Convert the 'phase_score' column to numeric, forcing errors to NaN
-        TT_picksNew['phase_score'] = pd.to_numeric(TT_picksNew['phase_score'], errors='coerce')
+        # Ensure 'phase_score' is numeric
+        TT_picksNew.loc[:, 'phase_score'] = pd.to_numeric(TT_picksNew['phase_score'], errors='coerce')
+
+        # Filter picks based on phase score threshold
+        TT_picksNew = TT_picksNew[TT_picksNew["phase_score"] > minPhaseScore]
+
+        # Assign quality values based on thresholds
         conditions = [
             (TT_picksNew['phase_score'] >= qualityThresHold[0]),
             (TT_picksNew['phase_score'] >= qualityThresHold[1]) & (TT_picksNew['phase_score'] < qualityThresHold[0]),
             (TT_picksNew['phase_score'] >= qualityThresHold[2]) & (TT_picksNew['phase_score'] < qualityThresHold[1]),
             (TT_picksNew['phase_score'] < qualityThresHold[2])
         ]
-        TT_picksNew['Q'] = np.select(conditions, quality_values)
+        TT_picksNew = TT_picksNew.copy()  # Explicitly create a copy
+        TT_picksNew.loc[:, 'Q'] = np.select(conditions, quality_values)
 
-        # Pick ring provided and streamed channel list provided?
+        # Stream picks through pickRing if available
         if pickRing is not None and streamCh is not None:
-            # Checking if streamed channels have any new pick
+            # Filter only picks from the selected stream channels
             TT_picksNew = TT_picksNew[TT_picksNew["station_id"].isin(streamCh)]
             if len(TT_picksNew) > 0:
-                # Adding new picks to pickRing
+                # Add picks to pickRing
                 for _, pick in TT_picksNew.iterrows():
-                    chidx = np.where(streamCh == pick["station_id"])[0]
-                    picktime = pick["phase_time"].strftime("%Y-%m-%dT%H%M%S.%f+00:00")[:-6].replace("-", "").replace("T","").replace(":", "")
-                    pickString = "8 99 4 %s %s ?%s %s 0 0 0"%(Pickcounter, chCodes[chidx], pick['Q'], picktime)
+                    chidx = np.where(pick["station_id"] == streamCh)[0]
+                    picktime = pick["phase_time"].strftime("%Y-%m-%dT%H%M%S.%f+00:00")[:-6].replace("-", "").replace("T", "").replace(":", "")
+                    pickString = "8 99 4 %s %s ?%s %s 0 0 0" % (Pickcounter, chCodes[chidx][0], pick['Q'], picktime)
                     pickRing.put_msg(1, 8, pickString)
+                    print(pickString)
                     Pickcounter += 1
         else:
             print("Cannot stream picks through pick ring without a running pickRing and a provided streamCh")
+
     # Drop the 'time_diff' column as it's no longer needed
     TT_picks = TT_picks.drop(columns=['time_diff'])
+    
     return TT_picks

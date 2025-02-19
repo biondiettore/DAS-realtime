@@ -54,7 +54,7 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
         streamCh = None
         chCodes = None
         if ringbuff.channels_info is not None:
-            streamCh = ringbuff.chIds
+            streamCh = np.array(ringbuff.chIds)
             chCodes = ringbuff.statNames   
 
         # Factors to convert phase to strain

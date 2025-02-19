@@ -34,7 +34,7 @@ def predict(meta: Data):
 
     with torch.inference_mode():
 
-        with torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.amp.autocast(device_type=args.device, enabled=args.amp):
             
             scores = torch.softmax(model(meta), dim=1)  # [batch, nch, nt, nsta]
             topk_scores, topk_inds = detect_peaks(scores, vmin=args.min_prob, kernel=21)
@@ -117,7 +117,7 @@ def predict(meta: Data):
 
     with torch.inference_mode():
 
-        with torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.amp.autocast(device_type=args.device, enabled=args.amp):
             
             scores = torch.softmax(model(meta), dim=1)  # [batch, nch, nt, nsta]
             topk_scores, topk_inds = detect_peaks(scores, vmin=args.min_prob, kernel=21)
