@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Main script for real-time DAS data processing and streaming
 
-import socket
+import socket, zmq
 import argparse
 import numpy as np
 from DASPacket_Mod import *
@@ -15,7 +15,7 @@ import PyEW
 
 time_format = "%Y-%m-%dT%H%M%SZ"
 
-def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
+def doWork(strmRdr, args, waveRing=None, pickRing=None, loop=None, minimumPhaseNetTime=30.0):
     try:
 
         workInterval = args.workInterval
@@ -33,14 +33,13 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
         if workInterval >= ringbuff_size:
             raise ValueError("workInterval (%s) must be smaller than ringbuffer size (%s)"%(workInterval,ringbuff_size))
         taskPicking = None # Picking task to check if previous task is done
-        minimumPhaseNetTime = 30.0
         TT_picksBuf = None
 
         ii = 0 # packet counter
-        packet = getNextPacket(inp_socket)
-        fs = getFs(packet)
+        packet = strmRdr.getNextPacket()
+        fs = strmRdr.getFs(packet)
         deltaStrainRate = timedelta(seconds=float(0.5/fs))
-        nch = getNumChannel(packet)
+        nch = strmRdr.getNumChannel(packet)
         pickingChannel = np.arange(nch)
         if args.pickingChannel is not None:
             pickingChannel = np.loadtxt(args.pickingChannel, delimiter=',', dtype=int)
@@ -48,7 +47,6 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
         pickOutput = args.pickOutput
         startPicking = time.time()
 
-        decFact = getDecimation(packet)
         ringbuff = RingBuffer(int(ringbuff_size*fs), pickingChannel)
         ringbuff.setObspyTraceHeader(inventor)
         streamCh = None
@@ -58,39 +56,37 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
             chCodes = ringbuff.statNames   
 
         # Factors to convert phase to strain
-        GaugeL = getGaugeLengthProc(packet) # [m]
-        nFiber = 1.4682
-        lamdLaser = 1550.0
-        eta = 0.78 # photo-elastic scaling factor for longitudinal strain in isotropic material
-        factor = 4.0*np.pi*eta*nFiber*GaugeL/lamdLaser
-        # Conversion factor from raw to delta phase
-        radconv = 1.0
-        phaseLSB = getPhaseLSB(packet)
-        scaleFactor = 2*np.pi/(2**phaseLSB)
-        conv_factor = 1.0/factor/radconv*scaleFactor
+        conv_factor = strmRdr.getConversionFactor(packet)
+        if strainRate: 
+            conv_factor *= fs # Division by dt
 
-        OldtimeSample = getPayloadRad(packet)*conv_factor
-        if strainRate:
-            packet = getNextPacket(inp_socket)
-            currtimeSample = getPayloadRad(packet)*conv_factor
-            ringbuff.append(currtimeSample-OldtimeSample, timestamps=getPacketTimestamp(packet)-deltaStrainRate)
+        OldtimeSample = strmRdr.getPayloadRad(packet)*conv_factor
+        if strainRate: 
+            packet = strmRdr.getNextPacket()
+            currtimeSample = strmRdr.getPayloadRad(packet)*conv_factor
+            ringbuff.append(currtimeSample-OldtimeSample, timestamps=strmRdr.getPacketTimestamp(packet)-deltaStrainRate)
             OldtimeSample = currtimeSample
         else:
-            ringbuff.append(OldtimeSample, timestamps=getPacketTimestamp(packet))
-        ii += 1
-        oldSample = getSampleCount(packet)
+            ringbuff.append(OldtimeSample, timestamps=strmRdr.getPacketTimestamp(packet))
+        ii += strmRdr.getNumTimeSamples(packet)
         while True:
-            packet = getNextPacket(inp_socket)
+            packet = strmRdr.getNextPacket()
             if packet == b'': break
+            
+            # Computing time step difference between last sample and lastest sample received to check for data gaps
+            if strmRdr.getNumTimeSamples(packet) > 1:
+                curr_timestamp = strmRdr.getPacketTimestamp(packet)[0]
+                last_timestamp = ringbuff.getTimeStamps()[-1]
+            else:
+                curr_timestamp = strmRdr.getPacketTimestamp(packet)
+                last_timestamp = ringbuff.getTimeStamps()[-1]
+            timediff = (curr_timestamp - last_timestamp).total_seconds()
+            if strainRate:
+                timediff -= float(0.5/fs) # to account for origin shift of the strain rate 
 
-            # Checking if samples have been skipped
-            currSample =  getSampleCount(packet)
-            nSamples = currSample - oldSample
-            oldSample = currSample
-
-            if nSamples != decFact and ii > 0:
+            if ~np.isclose(1.0/fs,timediff,atol=1e-3):
                 print("Skipped samples", flush=True)
-                print(f'Packet timestamp and number of samples: {getPacketTimestamp(packet)}, {nSamples}', flush=True)
+                print(f'Packet current and last timestamps: {last_timestamp}, {curr_timestamp}; time gap: {timediff}', flush=True)
                 if filelength > 0.0 and filepath is not None:
                     print("Writing file at %s"%ringbuff.getTimeStamps()[-1].strftime(time_format), flush=True)
                     # Writing mseed traces
@@ -99,17 +95,18 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
                 return
         
             # Filling the buffer
-            currtimeSample = getPayloadRad(packet)*conv_factor
+            currtimeSample = strmRdr.getPayloadRad(packet)*conv_factor
             if strainRate:
-                ringbuff.append(currtimeSample-OldtimeSample, timestamps=getPacketTimestamp(packet)-deltaStrainRate)
+                ringbuff.append(currtimeSample-OldtimeSample, timestamps=strmRdr.getPacketTimestamp(packet)-deltaStrainRate)
                 OldtimeSample = currtimeSample
             else:
-                ringbuff.append(currtimeSample, timestamps=getPacketTimestamp(packet))
-            ii += 1
+                ringbuff.append(currtimeSample, timestamps=strmRdr.getPacketTimestamp(packet))
+
+            ii += strmRdr.getNumTimeSamples(packet)
 
             # Do some processing every workInterval
             if workInterval > 0.0  and ii % int(workInterval*fs) == 0 and ii > 0:
-                # print(f'Packet timestamp and shape of ringbuffer: {ringbuff.getTimeStamps()[-1]}, {ringbuff.getData().shape}', flush=True)
+                # print(f'Packet first and last timestamp and shape of ringbuffer: {ringbuff.getTimeStamps()[0]}, {ringbuff.getTimeStamps()[-1]}, {ringbuff.getData().shape}', flush=True)
                 # Picking has been requested if loop is not None
                 if loop is not None:
                     # Performing some checks before submitting picking task
@@ -153,61 +150,84 @@ def doWork(inp_socket, args, waveRing=None, pickRing=None, loop=None):
 waveRing = None
 pickRing = None
 loop = None
+
 def main():
     """Main function to perform picking and earthworm picks and data streaming"""
     # Global variables
-    global waveRing, pickRing, loop # Necessary to avoid restart of pick or/and wave rings
-    # Perform some checks on arguments.
-    try:
-        socket.inet_aton(args.host)
-    except socket.error:
-        error_exit("Invalid input host IP address")
-    if 1 > args.port > 65535:
+    global waveRing, pickRing, loop  # Necessary to avoid restart of pick or/and wave rings
+    
+    if not (1 <= args.port <= 65535):
         error_exit("Invalid input port number")
 
-    #Open source socket
+    strmType = args.streamType  # Stream data type
+    
+    if strmType == "OptaSense":
+        try:
+            socket.inet_aton(args.host)
+        except socket.error:
+            error_exit("Invalid input host IP address")
+        
+    elif strmType == "ASN":
+        try:
+            context = zmq.Context()
+        except Exception as e:
+            error_exit(f"Failed to initialize ZMQ context: {e}")
+    else:
+        raise ValueError(f"ERROR! streamType provided ({strmType}) not supported!")
+
+    # Checking if wave Ring parameters were passed
+    if args.wavering[0] and waveRing is None:
+        ringNumber, modID, inst_id, hb_freq, db_ew = args.wavering
+        waveRing = PyEW.EWModule(ringNumber, modID, inst_id, float(hb_freq), bool(db_ew))
+        waveRing.add_ring(ringNumber)
+        
+    if args.pickring[0] and pickRing is None:
+        ringNumber, modID, inst_id, hb_freq, db_ew = args.pickring
+        pickRing = PyEW.EWModule(ringNumber, modID, inst_id, float(hb_freq), bool(db_ew))
+        pickRing.add_ring(ringNumber)
+
+    # Checking if picking wave requested
+    if args.picking and loop is None:
+        loop = start_picking_thread(args.device)
+
+    print(f"Starting data streaming for {strmType}...", flush=True)
+
+    # **Open source socket & process data**
     while True:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as inp:
-            try:
-                print(f'Connecting to the data stream {args.host}:{args.port}...', flush=True)
-                inp.connect((args.host, args.port))
-            except Exception as e:
-                error_exit("Cannot connect to the data stream host: {e}")
-            print('Connected', flush=True)
-            # Checking if wave Ring parameters were passed
-            if args.wavering[0] and waveRing is None:
-                ringNumber = args.wavering[0]
-                modID = args.wavering[1]
-                inst_id = args.wavering[2]
-                hb_freq = float(args.wavering[3])
-                db_ew = bool(args.wavering[4])
-                # Connecting to existing Earthworm ring
-                waveRing = PyEW.EWModule(ringNumber, modID, inst_id, hb_freq, db_ew)
-                # Adding wave ring to pyEw Module object
-                waveRing.add_ring(ringNumber)
-            if args.pickring[0] and pickRing is None:
-                ringNumber = args.pickring[0]
-                modID = args.pickring[1]
-                inst_id = args.pickring[2]
-                hb_freq = float(args.pickring[3])
-                db_ew = bool(args.pickring[4])
-                # Connecting to existing Earthworm ring
-                pickRing = PyEW.EWModule(ringNumber, modID, inst_id, hb_freq, db_ew)
-                # Adding wave ring to pyEw Module object
-                pickRing.add_ring(ringNumber)
-            # Checking if picking wave requested
-            if args.picking and loop is None:
-                loop = start_picking_thread(args.device)
-            # Starting processing 
-            doWork(inp, args, loop=loop, waveRing=waveRing, pickRing=pickRing)
-            print('Got disconnected from the data stream', flush=True)
-            inp.close()
+        try:
+            if strmType == "OptaSense":
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as inp:
+                    print(f'Connecting to OptaSense data stream {args.host}:{args.port}...', flush=True)
+                    inp.connect((args.host, args.port))
+                    print('Connected to OptaSense', flush=True)             
+                    # Creating StreamReader
+                    strmRdr = OptaSenseStreamReader(inp)             
+                    # Start processing
+                    doWork(strmRdr, args, loop=loop, waveRing=waveRing, pickRing=pickRing)
+
+            elif strmType == "ASN":
+                with context.socket(zmq.SUB) as inp:
+                    print(f"Connecting to ASN data stream on {args.host}:{args.port}...", flush=True)
+                    inp.connect(f"tcp://{args.host}:{args.port}")
+                    inp.setsockopt(zmq.SUBSCRIBE, b'')  # Subscribe to all messages
+                    print('Connected to ASN', flush=True) 
+                    strmRdr = ASN_StreamReader(inp)  
+                    doWork(strmRdr, args, loop=loop, waveRing=waveRing, pickRing=pickRing)
+
+        except zmq.ZMQError as e:
+            print(f"ASN stream error: {e}", flush=True)
+            time.sleep(5)  # Retry after a short delay
+                    
+        except Exception as e:
+            print(f"Error connecting to {strmType} stream: {e}", flush=True)
+            time.sleep(5)  # Retry after a short delay
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Main program to process real-time DAS data streams.\n")
     parser.add_argument('--host', metavar='HOST', required=True, help='a hostname of the input data stream')
     parser.add_argument('--port', metavar='PORT', type=int, required=True, help='a port of the input data stream')
+    parser.add_argument('--streamType', '-strTp', metavar='streamType', type=str, required=True, help='Stream data type. Currently supported: OptaSense, ASN')
     parser.add_argument('--strainRate', '-strnRt', metavar='strainRate', type=int, default=1, help='Save strain rate or strain. Default 1')
     parser.add_argument('--workInterval', '-wrkint', metavar='workInterval', type=float, default=1.0, help='Work interval for data processing. Default 1.0 [s]')
     parser.add_argument('--picking', '-pick', metavar='picking', type=int, default=0, help='Flag to run picking using PhaseNet-DAS (Zhu et al., 2023)')

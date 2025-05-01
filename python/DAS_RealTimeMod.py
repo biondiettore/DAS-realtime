@@ -38,89 +38,18 @@ class RingBuffer:
         self.good_ch = good_ch
         self.channels_info = None
         self.timeStamps = [] # Rolling buffer of timestamp axis
-
-    class __Full:
-            """ class that implements a full buffer """
-            def append(self, x, timestamps=None):
-                """ Append an element overwriting the oldest one. """
-                self.data[self.cur] = np.expand_dims(x[self.good_ch], axis=1)
-                if timestamps is not None:
-                    self.timeStamps[self.cur] = timestamps
-                self.cur = (self.cur+1) % self.max
-            
-            def getData(self):
-                """ Return array of elements in correct order """
-                return np.concatenate(self.data[self.cur:]+self.data[:self.cur], axis=1)
-            
-            def getTimeStamps(self):
-                """ Return array of timestamps in correct order """
-                return np.array(self.timeStamps[self.cur:]+self.timeStamps[:self.cur])
-            
-            def writeObsPyTraces(self, fs, datapath, scaling=1e6):
-                """Method to write Obspy traces"""
-                if self.channels_info is None:
-                    raise ValueError("Call method setObspyTraceHeader to set trace info before using writeObsPyTraces")
-                # Getting channel data to write and timestamps
-                traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
-                timeStamps = self.getTimeStamps()
-                # Loop for writing traces
-                for idx in range(len(self.chIds)):
-                    self.stats[idx].sampling_rate = fs
-                    self.stats[idx].npts = traceData.shape[1]
-                    self.stats[idx].starttime = UTCDateTime(timeStamps[0])
-                    self.stats[idx].delta = 1.0/fs
-                    tr = Trace(traceData[idx,:], header=self.stats[idx])
-                    file_path = "%s/%s_%s.mseed"%(datapath,self.channels_info[idx], timeStamps[0].strftime(time_format))
-                    tr.write(file_path, format="MSEED", reclen=512, encoding='STEIM2')
-                    os.chmod(file_path, 0o644)
-                return
-            
-            def send2ew(self, fs, waveMod, ringID=0, scaling=1e6):
-                """
-                    Sends buffered seismic data to Earthworm wavering.
-
-                    Parameters:
-                        - fs (float): Sampling frequency of the data.
-                        - waveMod (object): Earthworm wave module instance to send data to.
-                        - ringID (int, optional): Identifier for the Earthworm ring. Defaults to 0.
-                        - scaling (float, optional): Scaling factor for the data. Defaults to 1e6.
-
-                    Returns:
-                        - None
-                """
-                if scaling > 1.0:
-                    traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
-                    dataFormat = 'i4'
-                else:
-                    # Not currently tested
-                    traceData = self.getData()[self.chIds,:].astype(np.float32)
-                    dataFormat = 'f4'
-                npts = traceData.shape[1]
-                timeStamps = self.getTimeStamps()
-                timestamp_init = timeStamps[0].timestamp()
-                for idx in range(len(self.chIds)):
-                    wave = {
-                        'station': self.stats[idx].station, 
-                        'network': self.stats[idx].network, 
-                        'channel': self.stats[idx].channel, 
-                        'location': '--', 
-                        'nsamp': npts, 
-                        'samprate': fs, 
-                        'startt': timestamp_init,
-                        'endt': timestamp_init+(npts-1)/fs,
-                        'datatype': dataFormat,
-                        'data': traceData[idx,:]
-                    }
-                    waveMod.put_wave(ringID, wave)
-                return
-            
+        
     def append(self, x, timestamps=None):
         """append an element at the end of the buffer"""
-        self.data.append(np.expand_dims(x[self.good_ch], axis=1))
+        if x.ndim == 2:
+            self.data.extend([np.expand_dims(row, axis=1) for row in x[:, self.good_ch]])
+        else:
+            self.data.append(np.expand_dims(x[self.good_ch], axis=1))
         if timestamps is not None:
-            self.timeStamps.append(timestamps)
-        if len(self.data) == self.max:
+            self.timeStamps += list(timestamps) if x.ndim == 2 else [timestamps]
+        if len(self.data) >= self.max:
             self.cur = 0
+            self.max = len(self.data) # To allow for non-divisible data packets
             # Permanently change self's class from non-full to full
             self.__class__ = self.__Full
 
@@ -205,6 +134,90 @@ class RingBuffer:
             }
             waveMod.put_wave(ringID, wave)
         return
+    
+    class __Full:
+            """ class that implements a full buffer """
+            def append(self, x, timestamps=None):
+                """Append an element overwriting the oldest one."""
+                if x.ndim == 2:
+                    ntimes = x.shape[0]
+                    for idx in range(ntimes):
+                        self.data[self.cur] = np.expand_dims(x[idx, self.good_ch], axis=1)
+                        if timestamps is not None:
+                            self.timeStamps[self.cur] = timestamps[idx]
+                        self.cur = (self.cur + 1) % self.max
+                else:
+                    self.data[self.cur] = np.expand_dims(x[self.good_ch], axis=1)
+                    if timestamps is not None:
+                        self.timeStamps[self.cur] = timestamps
+                    # Update pointer
+                    self.cur = (self.cur + 1) % self.max
+            
+            def getData(self):
+                """ Return array of elements in correct order """
+                return np.concatenate(self.data[self.cur:]+self.data[:self.cur], axis=1)
+            
+            def getTimeStamps(self):
+                """ Return array of timestamps in correct order """
+                return np.array(self.timeStamps[self.cur:]+self.timeStamps[:self.cur])
+            
+            def writeObsPyTraces(self, fs, datapath, scaling=1e6):
+                """Method to write Obspy traces"""
+                if self.channels_info is None:
+                    raise ValueError("Call method setObspyTraceHeader to set trace info before using writeObsPyTraces")
+                # Getting channel data to write and timestamps
+                traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
+                timeStamps = self.getTimeStamps()
+                # Loop for writing traces
+                for idx in range(len(self.chIds)):
+                    self.stats[idx].sampling_rate = fs
+                    self.stats[idx].npts = traceData.shape[1]
+                    self.stats[idx].starttime = UTCDateTime(timeStamps[0])
+                    self.stats[idx].delta = 1.0/fs
+                    tr = Trace(traceData[idx,:], header=self.stats[idx])
+                    file_path = "%s/%s_%s.mseed"%(datapath,self.channels_info[idx], timeStamps[0].strftime(time_format))
+                    tr.write(file_path, format="MSEED", reclen=512, encoding='STEIM2')
+                    os.chmod(file_path, 0o644)
+                return
+            
+            def send2ew(self, fs, waveMod, ringID=0, scaling=1e6):
+                """
+                    Sends buffered seismic data to Earthworm wavering.
+
+                    Parameters:
+                        - fs (float): Sampling frequency of the data.
+                        - waveMod (object): Earthworm wave module instance to send data to.
+                        - ringID (int, optional): Identifier for the Earthworm ring. Defaults to 0.
+                        - scaling (float, optional): Scaling factor for the data. Defaults to 1e6.
+
+                    Returns:
+                        - None
+                """
+                if scaling > 1.0:
+                    traceData = (self.getData()[self.chIds,:]*scaling).astype(np.int32)
+                    dataFormat = 'i4'
+                else:
+                    # Not currently tested
+                    traceData = self.getData()[self.chIds,:].astype(np.float32)
+                    dataFormat = 'f4'
+                npts = traceData.shape[1]
+                timeStamps = self.getTimeStamps()
+                timestamp_init = timeStamps[0].timestamp()
+                for idx in range(len(self.chIds)):
+                    wave = {
+                        'station': self.stats[idx].station, 
+                        'network': self.stats[idx].network, 
+                        'channel': self.stats[idx].channel, 
+                        'location': '--', 
+                        'nsamp': npts, 
+                        'samprate': fs, 
+                        'startt': timestamp_init,
+                        'endt': timestamp_init+(npts-1)/fs,
+                        'datatype': dataFormat,
+                        'data': traceData[idx,:]
+                    }
+                    waveMod.put_wave(ringID, wave)
+                return
 
 
 ############################################################################################################
