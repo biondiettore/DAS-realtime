@@ -151,7 +151,7 @@ def phasenet_das(das_data, timestamp, ev_id, dt):
 
 
 def extract_peak_amp(data,TT,fs,ot,f1,f2, chIDs=None, align_wind=1.0):
-    """Function to compute SNR for a given earthquake"""
+    """Function to extract peak amplitude for a given arrival time"""
     maxAmp = np.zeros_like(TT)
     nch = data.shape[0] if chIDs is None else chIDs.shape[0]
     nt = data.shape[1]
