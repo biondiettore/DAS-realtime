@@ -138,41 +138,135 @@ class OptaSenseStreamReader(StreamReader):
     def __init__(self, socket):
         self.buffer = b''
         self.socket = socket
-        raise NotImplementedError("OptaSenseStreamReader not available as open source. Contact Luna Innovations to request the code.")
+
+    def getPacketHeaderSize(self, packet):
+        return int(self.from_bytes(packet[8:9]))
+    
+    def getPacketPayloadSize(self, packet):
+        return int(self.from_bytes(packet[12:15]))
+    
+    def getPacketFooterSize(self, packet):
+        return int(self.from_bytes(packet[9:10]))
+
+    def getPacketSize(self, header):
+        SW0 = header[0:4]
+        SW1 = header[4:8]
+        if SW0 != b'\xff\xff\xff\x7f' or SW1 != b'\x00\x00\x00\x80':
+            raise RuntimeError("No Sync Word found in the data. Wrong format?")
+        return (self.getPacketHeaderSize(header) +
+                self.getPacketPayloadSize(header) +
+                self.getPacketFooterSize(header))
 
     def getNextPacket(self):
-        raise NotImplementedError("getNextPacket must be overridden")
+        BUFF_SIZE = 2048
+        LEN_SIZE = 16
         
+        chunks = []
+        bytes_recd = len(self.buffer)
+        while bytes_recd < LEN_SIZE:
+            chunk = self.socket.recv(min(LEN_SIZE - bytes_recd, BUFF_SIZE))
+            if chunk == b'':
+                raise RuntimeError("socket connection broken")
+            chunks.append(chunk)
+            bytes_recd += len(chunk)
+        self.buffer += b''.join(chunks)
+        
+        chunks = []
+        PACKET_LEN = self.getPacketSize(self.buffer)
+        bytes_recd = len(self.buffer)
+        while bytes_recd < PACKET_LEN:
+            chunk = self.socket.recv(min(PACKET_LEN - bytes_recd, BUFF_SIZE))
+            if chunk == b'':
+                raise RuntimeError("socket connection broken")
+            chunks.append(chunk)
+            bytes_recd += len(chunk)
+        self.buffer += b''.join(chunks)
+        
+        packet = self.buffer[:PACKET_LEN]
+        self.buffer = self.buffer[PACKET_LEN:]
+        return packet
+    
+    def from_bytes(self, data, big_endian=False):
+        if isinstance(data, str):
+            data = bytearray(data)
+        if big_endian:
+            data = reversed(data)
+        num = 0
+        for offset, byte in enumerate(data):
+            num += byte << (offset * 8)
+        return num
+    
     def getPacketTimestamp(self, header):
-        """Returns a timestamp from the header."""
-        raise NotImplementedError("getPacketTimestamp must be overridden")
-
+        """Function to obtain timestamp sample"""
+        '''Returns a timestamp from the header in the following format: yyyy-MM-ddThh:mm:ss.uuuuuu.'''
+        seconds = int(self.from_bytes(header[96:100])) #Seconds since 0:00 Jan 01 2000
+        milliseconds = int(self.from_bytes(header[100:104]))/1000000 #Nanoseconds in the header
+        base_datetime = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        delta = timedelta(0, seconds, 0, milliseconds)
+        timestamp = (base_datetime + delta)
+        return timestamp
+    
     def getNumTimeSamples(self, packet):
-        raise NotImplementedError("getNumTimeSamples must be overridden")
-
+        return int(self.from_bytes(packet[80:81]))
+    
     def getSampleCount(self, packet):
-        raise NotImplementedError("getSampleCount must be overridden")
-
+        return np.int64(self.from_bytes(packet[88:96]))
+    
     def getNumChannel(self, packet):
-        raise NotImplementedError("getNumChannel must be overridden")
-
-    def getGaugeLengthProc(self, packet):
-        raise NotImplementedError("getGaugeLengthProc must be overridden")
-
+        return int(self.from_bytes(packet[76:79]))
+    
+    def getGaugeLengthProc(self, packet, nFiber=1.4682, c=299792458.0):
+        u16ADCClock = 1.0 / float(self.from_bytes(packet[52:54]))
+        return int(self.from_bytes(packet[60:62])) * c * 1e-6 * u16ADCClock / nFiber * 0.5
+    
+    def getTimePerPacket(self, packet):
+        u16ADCClock = int(self.from_bytes(packet[52:54]))
+        u32PingPeriodCsu = int(self.from_bytes(packet[44:47]))
+        u16Decimation = self.getDecfactorORsamplesPerPacket(packet)
+        u8NumTimeSamples = self.getNumTimeSamples(packet)
+        return int(1 / (u16ADCClock / u32PingPeriodCsu / u16Decimation)) * u8NumTimeSamples
+    
     def getHeader(self, packet):
-        raise NotImplementedError("getHeader must be overridden")
-
+        return packet[:self.getPacketHeaderSize(packet)]
+    
     def getPayload(self, packet):
-        raise NotImplementedError("getPayload must be overridden")
-
+        header_size = self.getPacketHeaderSize(packet)
+        payload_size = self.getPacketPayloadSize(packet)
+        return packet[header_size:header_size + payload_size]
+    
+    def getFooter(self, packet):
+        return packet[-self.getPacketFooterSize(packet):]
+    
     def getPayloadRad(self, packet):
-        raise NotImplementedError("getPayloadRad must be overridden")
-
+        dataWidth = self.getDataWidth(packet) // 8
+        dtype = '<i2' if dataWidth == 2 else '<i4'
+        return np.frombuffer(self.getPayload(packet), dtype=dtype)
+    
+    def getPhaseLSB(self, packet):
+        return int(self.from_bytes(packet[62:63]))
+    
+    def getDataWidth(self, packet):
+        return int(self.from_bytes(packet[75:76]))
+    
     def getDecfactorORsamplesPerPacket(self, packet):
-        raise NotImplementedError("getDecfactorORsamplesPerPacket must be overridden")
-
+        return int(self.from_bytes(packet[82:84]))
+    
+    def getOCP(self, packet):
+        return int(self.from_bytes(packet[81:82]))
+    
     def getFs(self, packet):
-        raise NotImplementedError("getFs must be overridden")
-
+        u16ADCClock = int(self.from_bytes(packet[52:54]))
+        u32PingPeriodCsu = int(self.from_bytes(packet[44:47]))
+        u16Decimation = self.getDecfactorORsamplesPerPacket(packet)
+        return u16ADCClock / u32PingPeriodCsu / u16Decimation * 1000000
+    
     def getConversionFactor(self, packet):
-        raise NotImplementedError("getConversionFactor must be overridden")
+        GaugeL = self.getGaugeLengthProc(packet)
+        nFiber = 1.4682
+        lamdLaser = 1550.0
+        eta = 0.78
+        factor = 4.0 * np.pi * eta * nFiber * GaugeL / lamdLaser
+        radconv = 1.0
+        phaseLSB = self.getPhaseLSB(packet)
+        scaleFactor = 2 * np.pi / (2 ** phaseLSB)
+        return 1.0 / factor / radconv * scaleFactor
